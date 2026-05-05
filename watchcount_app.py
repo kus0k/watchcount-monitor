@@ -142,11 +142,30 @@ class WatchCountMonitor:
                 self.log(f"   ⚠️ Ошибка парсинга HTML: {str(e)}")
                 return
 
-            # Ищем строки таблицы с аукционами
+            # Пробуем разные селекторы для поиска аукционов
+            items = []
+
+            # Вариант 1: Таблица с классом item_row
             items = soup.find_all('tr', {'class': 'item_row'})
 
+            # Вариант 2: Если не найдено, ищем div с классом item
             if not items:
-                self.log(f"   ⚠️ Результаты не найдены")
+                items = soup.find_all('div', {'class': 'item'})
+
+            # Вариант 3: Если не найдено, ищем любые tr в таблице
+            if not items:
+                table = soup.find('table', {'class': 'results'})
+                if table:
+                    items = table.find_all('tr')[1:]  # Пропускаем заголовок
+
+            # Вариант 4: Ищем по data-атрибутам
+            if not items:
+                items = soup.find_all('tr', {'data-item-id': True})
+
+            if not items:
+                self.log(f"   ⚠️ Результаты не найдены (попробуем другой подход)")
+                # Логируем HTML для отладки
+                self.log(f"   📄 HTML длина: {len(response.content)} байт")
                 return
 
             self.log(f"   ✓ Найдено {len(items)} аукционов")
@@ -154,38 +173,45 @@ class WatchCountMonitor:
 
             for item in items:
                 try:
-                    # Название и ссылка
-                    title_elem = item.find('a', {'class': 'item_title'})
-                    if not title_elem:
+                    # Пробуем разные способы получить данные
+                    title = None
+                    item_url = None
+                    price = None
+                    bids = 0
+                    time_left = "N/A"
+
+                    # Способ 1: Стандартная таблица
+                    title_elem = item.find('a')
+                    if title_elem:
+                        title = title_elem.get_text(strip=True)
+                        item_url = title_elem.get('href', '')
+
+                    if not title:
                         continue
-                    title = title_elem.get_text(strip=True)
-                    item_url = title_elem.get('href', '')
 
                     # Цена
-                    price_elem = item.find('td', {'class': 'price'})
-                    if not price_elem:
-                        continue
-                    price_text = price_elem.get_text(strip=True)
-                    try:
-                        price = float(re.sub(r'[^\d.]', '', price_text.split()[0]))
-                    except:
-                        continue
+                    tds = item.find_all('td')
+                    if len(tds) >= 2:
+                        price_text = tds[1].get_text(strip=True) if len(tds) > 1 else ""
+                        try:
+                            price = float(re.sub(r'[^\d.]', '', price_text.split()[0]))
+                        except:
+                            price = 0
 
                     # Ставки
-                    bids_elem = item.find('td', {'class': 'bids'})
-                    bids = 0
-                    if bids_elem:
+                    if len(tds) >= 3:
+                        bids_text = tds[2].get_text(strip=True) if len(tds) > 2 else ""
                         try:
-                            bids_text = bids_elem.get_text(strip=True)
                             bids = int(re.sub(r'[^\d]', '', bids_text.split()[0]))
                         except:
                             bids = 0
 
                     # Время завершения
-                    time_elem = item.find('td', {'class': 'time_left'})
-                    time_left = "N/A"
-                    if time_elem:
-                        time_left = time_elem.get_text(strip=True)
+                    if len(tds) >= 4:
+                        time_left = tds[3].get_text(strip=True) if len(tds) > 3 else "N/A"
+
+                    if not price:
+                        continue
 
                     # Проверяем фильтры
                     if price >= min_price and price <= max_price and bids >= min_bids:
