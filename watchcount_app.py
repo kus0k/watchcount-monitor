@@ -10,20 +10,6 @@ import json
 import random
 import os
 
-# Selenium для JavaScript рендеринга
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.options import Options
-    from webdriver_manager.chrome import ChromeDriverManager
-    from selenium.webdriver.chrome.service import Service
-    SELENIUM_AVAILABLE = True
-except ImportError:
-    SELENIUM_AVAILABLE = False
-    print("⚠️ Selenium не установлен. Используй: pip install selenium webdriver-manager")
-
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
@@ -40,25 +26,267 @@ USER_AGENTS = [
 def get_random_user_agent():
     return random.choice(USER_AGENTS)
 
-def get_selenium_driver():
-    """Создает Selenium WebDriver для Chrome"""
-    if not SELENIUM_AVAILABLE:
-        return None
+class WatchCountMonitor:
+    def __init__(self):
+        self.is_running = False
+        self.found_auctions = set()
+        self.logs = []
+        self.auctions = []
+        self.monitor_thread = None
+        self.ending_time = 1
 
+    def log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        self.logs.append(log_entry)
+        if len(self.logs) > 100:
+            self.logs.pop(0)
+
+    def add_auction(self, title, price, bids, url, time_left):
+        auction = {
+            'title': title,
+            'price': price,
+            'bids': bids,
+            'url': url,
+            'time_left': time_left,
+            'timestamp': datetime.now().strftime("%H:%M:%S")
+        }
+        self.auctions.insert(0, auction)
+        if len(self.auctions) > 50:
+            self.auctions.pop()
+
+    def start_monitoring(self, keywords, min_price, max_price, min_bids, ending_time, interval):
+        if self.is_running:
+            return False
+
+        self.is_running = True
+        self.logs = []
+        self.auctions = []
+        self.ending_time = ending_time
+
+        self.log("="*80)
+        self.log("🚀 МОНИТОРИНГ WATCHCOUNT ЗАПУЩЕН")
+        self.log("="*80)
+
+        if keywords:
+            self.log(f"🔍 Ключевые слова: {keywords}")
+        else:
+            self.log(f"🔍 Поиск: ВСЕ аукционы")
+
+        self.log(f"💰 Цена: ${min_price} - ${max_price}")
+        self.log(f"📊 Минимум ставок: {min_bids}")
+        self.log(f"⏱️  Время завершения: {ending_time} мин")
+        self.log(f"⏱️  Интервал: {interval} сек")
+        self.log("="*80 + "\n")
+
+        self.monitor_thread = threading.Thread(
+            target=self.monitor_loop,
+            args=(keywords, min_price, max_price, min_bids, interval),
+            daemon=True
+        )
+        self.monitor_thread.start()
+        return True
+
+    def stop_monitoring(self):
+        self.is_running = False
+        self.log("\n⏹️  Мониторинг остановлен.\n")
+
+    def monitor_loop(self, keywords, min_price, max_price, min_bids, interval):
+        while self.is_running:
+            try:
+                if keywords:
+                    for keyword in keywords.split(','):
+                        if not self.is_running:
+                            break
+                        self.search_watchcount(keyword.strip(), min_price, max_price, min_bids)
+                        time.sleep(2)
+                else:
+                    self.search_watchcount('', min_price, max_price, min_bids)
+
+                self.log(f"⏳ Следующая проверка через {interval} сек...\n")
+                time.sleep(interval)
+            except Exception as e:
+                self.log(f"❌ Ошибка: {str(e)}")
+                time.sleep(5)
+
+    def search_watchcount(self, keyword, min_price, max_price, min_bids):
+        try:
+            if keyword:
+                self.log(f"🔍 Поиск: '{keyword}'...")
+            else:
+                self.log(f"🔍 Поиск: ВСЕ аукционы...")
+
+            # WatchCount URL для поиска
+            if keyword:
+                url = f"https://www.watchcount.com/search.php?q={keyword}&sort=ending_soonest"
+            else:
+                url = "https://www.watchcount.com/search.php?sort=ending_soonest"
+
+            headers = {
+                'User-Agent': get_random_user_agent(),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.watchcount.com/',
+            }
+
+            try:
+                response = requests.get(url, headers=headers, timeout=15)
+                response.raise_for_status()
+            except Exception as e:
+                self.log(f"   ⚠️ Ошибка подключения: {str(e)[:80]}")
+                return
+
+            try:
+                soup = BeautifulSoup(response.content, 'html.parser')
+            except Exception as e:
+                self.log(f"   ⚠️ Ошибка парсинга HTML: {str(e)}")
+                return
+
+            # Ищем все таблицы
+            tables = soup.find_all('table')
+            self.log(f"   📊 Найдено таблиц: {len(tables)}")
+
+            items = []
+            for table in tables:
+                rows = table.find_all('tr')
+                if len(rows) > 5:  # Таблица с результатами должна иметь много строк
+                    items = rows[1:]  # Пропускаем заголовок
+                    break
+
+            if not items:
+                self.log(f"   ⚠️ Результаты не найдены")
+                return
+
+            self.log(f"   ✓ Найдено {len(items)} аукционов")
+            found_count = 0
+
+            for item in items:
+                try:
+                    tds = item.find_all('td')
+                    if len(tds) < 4:
+                        continue
+
+                    # Название и ссылка
+                    title_elem = tds[0].find('a')
+                    if not title_elem:
+                        continue
+                    title = title_elem.get_text(strip=True)
+                    item_url = title_elem.get('href', '')
+
+                    if not title or not item_url:
+                        continue
+
+                    # Цена
+                    price_text = tds[1].get_text(strip=True)
+                    try:
+                        price = float(re.sub(r'[^\d.]', '', price_text.split()[0]))
+                    except:
+                        continue
+
+                    # Ставки
+                    bids_text = tds[2].get_text(strip=True)
+                    try:
+                        bids = int(re.sub(r'[^\d]', '', bids_text.split()[0]))
+                    except:
+                        bids = 0
+
+                    # Время завершения
+                    time_left = tds[3].get_text(strip=True) if len(tds) > 3 else "N/A"
+
+                    # Проверяем фильтры
+                    if price >= min_price and price <= max_price and bids >= min_bids:
+                        # Проверяем время завершения
+                        if self.check_ending_time(time_left):
+                            auction_id = f"{title}_{item_url}"
+                            if auction_id not in self.found_auctions:
+                                self.found_auctions.add(auction_id)
+                                self.log(f"✅ НАЙДЕН: {title[:60]}... | ${price} | Ставок: {bids} | {time_left}")
+                                self.add_auction(title, f"${price}", bids, item_url, time_left)
+                                found_count += 1
+
+                except Exception as e:
+                    continue
+
+            if found_count == 0:
+                self.log(f"   Подходящих аукционов не найдено")
+
+        except Exception as e:
+            self.log(f"❌ Ошибка: {str(e)}")
+
+    def check_ending_time(self, time_str):
+        """Проверяет, заканчивается ли аукцион в течение ending_time минут"""
+        try:
+            time_str = time_str.lower().strip()
+            total_minutes = 0
+
+            # Дни
+            days_match = re.search(r'(\d+)\s*d', time_str)
+            if days_match:
+                total_minutes += int(days_match.group(1)) * 24 * 60
+
+            # Часы
+            hours_match = re.search(r'(\d+)\s*h', time_str)
+            if hours_match:
+                total_minutes += int(hours_match.group(1)) * 60
+
+            # Минуты
+            mins_match = re.search(r'(\d+)\s*m', time_str)
+            if mins_match:
+                total_minutes += int(mins_match.group(1))
+
+            return total_minutes <= self.ending_time * 60
+        except:
+            return False
+
+monitor = WatchCountMonitor()
+
+@app.route('/')
+def index():
+    response = render_template('watchcount.html')
+    response = app.make_response(response)
+    response.headers['Content-Type'] = 'text/html; charset=utf-8'
+    return response
+
+@app.route('/api/start', methods=['POST'])
+def start():
     try:
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument(f'user-agent={get_random_user_agent()}')
+        data = request.json
+        keywords = data.get('keywords', '')
+        min_price = float(data.get('min_price', 0))
+        max_price = float(data.get('max_price', 999999))
+        min_bids = int(data.get('min_bids', 1))
+        ending_time = int(data.get('ending_time', 1))
+        interval = int(data.get('interval', 60))
 
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        return driver
+        print(f"DEBUG: Starting WatchCount monitoring with: keywords={keywords}, min_price={min_price}, max_price={max_price}, min_bids={min_bids}, ending_time={ending_time}, interval={interval}")
+        success = monitor.start_monitoring(keywords, min_price, max_price, min_bids, ending_time, interval)
+        return json.dumps({'success': success}, ensure_ascii=False)
     except Exception as e:
-        print(f"❌ Ошибка при создании Selenium драйвера: {e}")
-        return None
+        print(f"DEBUG: Error in start(): {str(e)}")
+        return json.dumps({'success': False, 'error': str(e)}, ensure_ascii=False)
+
+@app.route('/api/stop', methods=['POST'])
+def stop():
+    try:
+        monitor.stop_monitoring()
+        return json.dumps({'success': True}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({'success': False, 'error': str(e)}, ensure_ascii=False)
+
+@app.route('/api/status')
+def status():
+    try:
+        return json.dumps({
+            'running': monitor.is_running,
+            'logs': monitor.logs[-20:],
+            'auctions': monitor.auctions[:10]
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({'error': str(e)}, ensure_ascii=False)
+
+if __name__ == '__main__':
+    app.run(debug=False, host='0.0.0.0', port=5001)
+
 
 class WatchCountMonitor:
     def __init__(self):
